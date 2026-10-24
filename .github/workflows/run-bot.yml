@@ -4,28 +4,30 @@ on:
   workflow_dispatch:
     inputs:
       count:
-        description: 'تعداد کاربر (پیشنهاد: 50 برای تست)'
+        description: 'تعداد کاربر (پیشنهاد تست: 50)'
         required: true
-        default: '10000'
+        default: '5000'
       hold:
-        description: 'ثانیه ماندن در اتاق (پیشنهاد: 30 برای تست)'
+        description: 'ثانیه ماندن در اتاق (پیشنهاد تست: 30)'
         required: true
-        default: '600'
+        default: '60'
 
 jobs:
   run-bot:
     runs-on: ubuntu-latest
     timeout-minutes: 350
     steps:
-      - uses: actions/checkout@v4
+      - name: Checkout
+        uses: actions/checkout@v4
 
-      - uses: actions/setup-node@v4
+      - name: Setup Node
+        uses: actions/setup-node@v4
         with:
           node-version: '20'
 
-      - run: npm install
+      - name: Install deps
+        run: npm install
 
       - name: Run bot
-        run: |
-          printf "%s\n%s\n" "${{ inputs.count }}" "${{ inputs.hold }}" | node --max-old-space-size=7000 app.js
+        run: node --max-old-space-size=7000 app.js ${{ inputs.count }} ${{ inputs.hold }}
         timeout-minutes: 340
