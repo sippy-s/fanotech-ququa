@@ -4,11 +4,11 @@ on:
   workflow_dispatch:
     inputs:
       count:
-        description: 'تعداد کاربر (پیشنهاد تست: 50)'
+        description: 'تعداد کاربر (پیشنهاد تست: 1 برای تشخیص، 50 برای تست)'
         required: true
-        default: '5000'
+        default: '500'
       hold:
-        description: 'ثانیه ماندن در اتاق (پیشنهاد تست: 30)'
+        description: 'ثانیه ماندن در اتاق (پیشنهاد تست: 10)'
         required: true
         default: '60'
 
@@ -28,6 +28,38 @@ jobs:
       - name: Install deps
         run: npm install
 
+      # ─────────────────────────────────────────────
+      # تشخیص شبکه: آیا IP GitHub به سرور دسترسی دارد؟
+      # ─────────────────────────────────────────────
+      - name: Network diagnostics
+        if: always()
+        run: |
+          echo "=== DNS ==="
+          getent hosts ws214.fanotech.ir || echo "DNS FAIL"
+          IP=$(getent hosts ws214.fanotech.ir | awk '{print $1}' | head -1)
+          echo "Resolved IP: $IP"
+
+          echo "=== TCP 443 ==="
+          timeout 10 bash -c "cat < /dev/null > /dev/tcp/ws214.fanotech.ir/443" \
+            && echo "TCP OK" || echo "TCP FAIL"
+
+          echo "=== TLS handshake ==="
+          timeout 15 bash -c "echo | openssl s_client -connect ws214.fanotech.ir:443 -servername ws214.fanotech.ir 2>/dev/null | head -5" \
+            || echo "TLS FAIL"
+
+          echo "=== HTTP HEAD ==="
+          timeout 20 curl -sS -o /dev/null -w "HTTP %{http_code} in %{time_total}s\n" \
+            -A "Mozilla/5.0" \
+            -H "Origin: https://conference.fanotech.ir" \
+            "https://ws214.fanotech.ir/" || echo "HTTP FAIL"
+
+          echo "=== Public IP of runner ==="
+          curl -sS https://api.ipify.org || true
+          echo
+
+      # ─────────────────────────────────────────────
+      # اجرای ربات
+      # ─────────────────────────────────────────────
       - name: Run bot
         run: node --max-old-space-size=7000 app.js ${{ inputs.count }} ${{ inputs.hold }}
         timeout-minutes: 340
