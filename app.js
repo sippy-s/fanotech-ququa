@@ -1,15 +1,16 @@
 /**
  * Fanotech / Ququa — Guest Login Bot (Socket.IO) — Heavy Load
- * ورود مهمان + WebRTC + چت + آپلود فایل
+ * ورود مهمان + WebRTC + آپلود فایل (چت غیرفعال)
  *
  * نصب:
  *   npm install socket.io-client
- * اجرا:
+ *
+ * اجرا (دستی، تعاملی):
  *   node --max-old-space-size=8192 app.js
  *
- * ⚠️ هشدار: این پیکربندی برای ۹٬۰۰۰ سوکت همزمان طراحی شده و
- * فشار شدیدی روی RAM، CPU، event loop و شبکه می‌آورد.
- * روی ماشین ۲ هسته‌ای اجرا نکن. VPS با ۸+ هسته و ۱۶GB+ RAM لازم است.
+ * اجرا (CI / غیرتعاملی):
+ *   node --max-old-space-size=8192 app.js <count> <holdSeconds>
+ *   مثال: node app.js 5000 300
  */
 
 const { io } = require('socket.io-client');
@@ -27,18 +28,18 @@ const ROOM_CODE = 'ququa';
 const ORIGIN = 'https://conference.fanotech.ir';
 
 const MAX_USERS = 10000;
-const CONCURRENCY = 500;              // ۵۰۰ اتصال موازی — فشار روی event loop
+const CONCURRENCY = 500;              // ۵۰۰ اتصال موازی
 const CONNECT_TIMEOUT_MS = 25000;
 const DEFAULT_HOLD_MS = 300000;       // ۵ دقیقه
 const JITTER_MS = 15000;              // قطع‌شدن‌ها پخش شوند
 
 // WebRTC
 const WEBRTC_ENABLED = true;
-const WEBRTC_DTLS = true;             // ۹۰۰۰ × DTLS = بار CPU سنگین
+const WEBRTC_DTLS = true;
 
-// چت
+// چت (غیرفعال — برای فعال‌سازی CHAT_ENABLED = true کنید)
 const CHAT_ENABLED = false;
-const CHAT_INTERVAL_MS = 30000;       // هر کاربر هر ۳۰s یک پیام → O(N²) broadcast
+const CHAT_INTERVAL_MS = 30000;
 const CHAT_MESSAGES = [
   'سلام', 'درود', 'خوبید؟', 'من هستم', 'تست', 'کسی هست؟',
   'لطفاً', 'ممنون', 'خداحافظ', '👍', '🙂', 'این یک پیام تستی است'
@@ -46,8 +47,8 @@ const CHAT_MESSAGES = [
 
 // آپلود فایل
 const UPLOAD_ENABLED = true;
-const UPLOAD_ON_JOIN = true;          // هر کاربر بعد از ورود یک فایل آپلود کند
-const UPLOAD_SIZE_BYTES = 10 * 1024;  // ۱۰KB — کوچک نگه دار تا پهنای باند نترکد
+const UPLOAD_ON_JOIN = true;
+const UPLOAD_SIZE_BYTES = 10 * 1024;  // ۱۰KB
 const UPLOAD_TMP = '/tmp/ququa_upload.bin';
 
 // ============================================================
@@ -122,7 +123,44 @@ function ask(q) {
   return new Promise(resolve => rl.question(q, a => { rl.close(); resolve(a); }));
 }
 
+// ============================================================
+// ورودی: اول از argv، بعد از stdin (برای اجرای دستی)
+// ============================================================
+async function getInputs() {
+  const argvCount = parseInt(process.argv[2], 10);
+  const argvHold  = parseInt(process.argv[3], 10);
+
+  let count, holdSec;
+
+  if (Number.isFinite(argvCount) && argvCount >= 1) {
+    count = Math.min(argvCount, MAX_USERS);
+  } else {
+    const raw = await ask(`چند کاربر مهمان وارد شوند؟ (1 تا ${MAX_USERS}): `);
+    count = parseInt(String(raw).trim(), 10);
+    if (!Number.isFinite(count) || count < 1) {
+      console.error('❌ عدد نامعتبر.');
+      process.exit(1);
+    }
+    if (count > MAX_USERS) {
+      console.warn(`⚠️  محدود به ${MAX_USERS}.`);
+      count = MAX_USERS;
+    }
+  }
+
+  if (Number.isFinite(argvHold) && argvHold >= 0) {
+    holdSec = argvHold;
+  } else {
+    const raw = await ask(`هر کاربر چند ثانیه در اتاق بماند؟ (Enter = ${DEFAULT_HOLD_MS / 1000}s): `);
+    holdSec = parseInt(String(raw).trim(), 10);
+    if (!Number.isFinite(holdSec) || holdSec < 0) holdSec = DEFAULT_HOLD_MS / 1000;
+  }
+
+  return { count, holdSec };
+}
+
+// ============================================================
 // فایل آپلود تستی (یک‌بار ساخته می‌شود، بین همه سوکت‌ها share)
+// ============================================================
 function ensureUploadFile() {
   if (!UPLOAD_ENABLED) return null;
   try {
@@ -138,7 +176,7 @@ function ensureUploadFile() {
 const UPLOAD_BUFFER = ensureUploadFile();
 
 // ============================================================
-// ورود یک مهمان + WebRTC + Chat + Upload
+// ورود یک مهمان + WebRTC + Upload (+ Chat اگر فعال)
 // ============================================================
 function joinAsGuest(name, holdMs) {
   return new Promise((resolve) => {
@@ -231,12 +269,9 @@ function joinAsGuest(name, holdMs) {
               },
               (resp) => {
                 if (resp && resp.id) rtcTransportId = resp.id;
-                // اگر سرور ack نداد، نادیده بگیر
               }
             );
-          } catch (e) {
-            // برخی سرورها این event را ندارند → خطا را ببلع
-          }
+          } catch (e) {}
         }
 
         // --- آپلود فایل بعد از ورود ---
@@ -252,12 +287,12 @@ function joinAsGuest(name, holdMs) {
                 roomCode: ROOM_CODE,
                 userID: userId
               },
-              () => {} // ack اختیاری
+              () => {}
             );
           } catch {}
         }
 
-        // --- چت دوره‌ای (broadcast → O(N²)) ---
+        // --- چت دوره‌ای (فقط اگر فعال باشد) ---
         if (CHAT_ENABLED) {
           chatTimer = setInterval(() => {
             try {
@@ -330,23 +365,16 @@ async function runPool(names, holdMs, concurrency) {
 // ============================================================
 (async () => {
   console.log('══════════════════════════════════════════════════════');
-  console.log('  Fanotech / Ququa — Guest Bot (Heavy: WebRTC+Chat+Upload)');
+  console.log('  Fanotech / Ququa — Guest Bot (Heavy: WebRTC+Upload)');
   console.log('══════════════════════════════════════════════════════');
   console.log(`  CONCURRENCY : ${CONCURRENCY}`);
   console.log(`  HOLD        : ${DEFAULT_HOLD_MS / 1000}s (+jitter ${JITTER_MS / 1000}s)`);
   console.log(`  WebRTC      : ${WEBRTC_ENABLED} (DTLS=${WEBRTC_DTLS})`);
-  console.log(`  Chat        : ${CHAT_ENABLED} (every ${CHAT_INTERVAL_MS / 1000}s → O(N²))`);
+  console.log(`  Chat        : ${CHAT_ENABLED}`);
   console.log(`  Upload      : ${UPLOAD_ENABLED} (${UPLOAD_SIZE_BYTES} bytes/user)`);
   console.log('══════════════════════════════════════════════════════\n');
 
-  const rawCount = await ask(`چند کاربر مهمان وارد شوند؟ (1 تا ${MAX_USERS}): `);
-  let count = parseInt(String(rawCount).trim(), 10);
-  if (!Number.isFinite(count) || count < 1) { console.error('❌ عدد نامعتبر.'); process.exit(1); }
-  if (count > MAX_USERS) { console.warn(`⚠️  محدود به ${MAX_USERS}.`); count = MAX_USERS; }
-
-  const rawHold = await ask(`هر کاربر چند ثانیه در اتاق بماند؟ (Enter = ${DEFAULT_HOLD_MS / 1000}s): `);
-  let holdSec = parseInt(String(rawHold).trim(), 10);
-  if (!Number.isFinite(holdSec) || holdSec < 0) holdSec = DEFAULT_HOLD_MS / 1000;
+  const { count, holdSec } = await getInputs();
 
   console.log(`\n🚀 ورود ${count} کاربر (همزمانی: ${CONCURRENCY}، نگه‌داری: ${holdSec}s)...\n`);
 
@@ -363,4 +391,7 @@ async function runPool(names, holdMs, concurrency) {
   console.log('════════════════════════════════════');
 
   process.exit(0);
-})();
+})().catch((e) => {
+  console.error('💥 Fatal:', e);
+  process.exit(1);
+});
