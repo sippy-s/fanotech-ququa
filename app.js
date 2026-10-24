@@ -27,6 +27,10 @@ const SOCKET_PATH = '/socket/socket/';
 const ROOM_CODE = 'ququa';
 const ORIGIN = 'https://conference.fanotech.ir';
 
+const USER_AGENT =
+  'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 ' +
+  '(KHTML, like Gecko) Chrome/156.0.0.0 Safari/537.36';
+
 const MAX_USERS = 10000;
 const CONCURRENCY = 500;              // ۵۰۰ اتصال موازی
 const CONNECT_TIMEOUT_MS = 25000;
@@ -187,9 +191,18 @@ function joinAsGuest(name, holdMs) {
       reconnection: false,
       timeout: CONNECT_TIMEOUT_MS,
       agent: httpAgent,
-      extraHeaders: { Origin: ORIGIN },
+      extraHeaders: {
+        Origin: ORIGIN,
+        'User-Agent': USER_AGENT,
+        'Accept-Language': 'fa-IR,fa;q=0.9,en;q=0.8'
+      },
       transportOptions: {
-        websocket: { extraHeaders: { Origin: ORIGIN } }
+        websocket: {
+          extraHeaders: {
+            Origin: ORIGIN,
+            'User-Agent': USER_AGENT
+          }
+        }
       }
     });
 
@@ -216,7 +229,7 @@ function joinAsGuest(name, holdMs) {
 
     socket.on('connect_error', (e) => {
       cleanup();
-      finish({ ok: false, error: 'connect: ' + e.message });
+      finish({ ok: false, error: 'connect: ' + (e && e.message ? e.message : String(e)) });
     });
 
     socket.on('connect', () => {
@@ -335,7 +348,7 @@ function joinAsGuest(name, holdMs) {
 // اجرای موازی محدود
 // ============================================================
 async function runPool(names, holdMs, concurrency) {
-  const results = { ok: 0, fail: 0 };
+  const results = { ok: 0, fail: 0, errors: {} };
   let index = 0;
 
   async function worker() {
@@ -349,7 +362,9 @@ async function runPool(names, holdMs, concurrency) {
         console.log(`[${String(i + 1).padStart(5, ' ')}] ✅ "${name}" → وارد شد (آنلاین: ${r.allUsers ?? '?'})`);
       } else {
         results.fail++;
-        console.log(`[${String(i + 1).padStart(5, ' ')}] ❌ "${name}" → ${r.error}`);
+        const key = String(r.error || 'unknown');
+        results.errors[key] = (results.errors[key] || 0) + 1;
+        console.log(`[${String(i + 1).padStart(5, ' ')}] ❌ "${name}" → ${key}`);
       }
     }
   }
@@ -367,6 +382,8 @@ async function runPool(names, holdMs, concurrency) {
   console.log('══════════════════════════════════════════════════════');
   console.log('  Fanotech / Ququa — Guest Bot (Heavy: WebRTC+Upload)');
   console.log('══════════════════════════════════════════════════════');
+  console.log(`  SERVER      : ${SERVER}${SOCKET_PATH}`);
+  console.log(`  ROOM        : ${ROOM_CODE}`);
   console.log(`  CONCURRENCY : ${CONCURRENCY}`);
   console.log(`  HOLD        : ${DEFAULT_HOLD_MS / 1000}s (+jitter ${JITTER_MS / 1000}s)`);
   console.log(`  WebRTC      : ${WEBRTC_ENABLED} (DTLS=${WEBRTC_DTLS})`);
@@ -388,7 +405,20 @@ async function runPool(names, holdMs, concurrency) {
   console.log(`❌ ناموفق:  ${results.fail}`);
   console.log(`📊 مجموع:   ${names.length}`);
   console.log(`⏱️  زمان:   ${elapsed} ثانیه`);
+  if (results.fail > 0) {
+    console.log('─── تفکیک خطاها ───');
+    for (const [k, v] of Object.entries(results.errors)) {
+      console.log(`   ${v.toString().padStart(5, ' ')} × ${k}`);
+    }
+  }
   console.log('════════════════════════════════════');
+
+  // اگر هیچ اتصالی موفق نشد، job را قرمز کن تا علت پنهان نماند
+  if (results.ok === 0) {
+    console.error('\n❌ هیچ اتصالی موفق نشد — احتمالاً IP دیتاسنتر (GitHub Actions) توسط سرور بلاک شده است.');
+    console.error('   برای تست: روی یک VPS با IP اختصاصی اجرا کن، یا step تشخیصی curl را ببین.');
+    process.exit(2);
+  }
 
   process.exit(0);
 })().catch((e) => {
