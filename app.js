@@ -37,7 +37,7 @@ const WEBRTC_ENABLED = true;
 const WEBRTC_DTLS = true;             // ۹۰۰۰ × DTLS = بار CPU سنگین
 
 // چت
-const CHAT_ENABLED = true;
+const CHAT_ENABLED = false;
 const CHAT_INTERVAL_MS = 30000;       // هر کاربر هر ۳۰s یک پیام → O(N²) broadcast
 const CHAT_MESSAGES = [
   'سلام', 'درود', 'خوبید؟', 'من هستم', 'تست', 'کسی هست؟',
