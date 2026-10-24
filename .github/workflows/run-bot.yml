@@ -1,23 +1,31 @@
-name: Run Node.js Bot
+name: Ququa Guest Bot (Heavy)
 
 on:
-  # این خط به شما اجازه می‌دهد تا workflow را به صورت دستی از تب Actions اجرا کنید
-  workflow_dispatch: 
+  workflow_dispatch:
+    inputs:
+      count:
+        description: 'تعداد کاربر (پیشنهاد: 50 برای تست)'
+        required: true
+        default: '10000'
+      hold:
+        description: 'ثانیه ماندن در اتاق (پیشنهاد: 30 برای تست)'
+        required: true
+        default: '600'
 
 jobs:
   run-bot:
     runs-on: ubuntu-latest
+    timeout-minutes: 350
     steps:
-      - name: Checkout repository
-        uses: actions/checkout@v4
+      - uses: actions/checkout@v4
 
-      - name: Setup Node.js
-        uses: actions/setup-node@v4
+      - uses: actions/setup-node@v4
         with:
-          node-version: '20' # یا هر نسخه‌ای که نیاز دارید
+          node-version: '20'
 
-      - name: Install dependencies
-        run: npm install socket.io-client
+      - run: npm install
 
-      - name: Run the bot script
-        run: node app.js
+      - name: Run bot
+        run: |
+          printf "%s\n%s\n" "${{ inputs.count }}" "${{ inputs.hold }}" | node --max-old-space-size=7000 app.js
+        timeout-minutes: 340
