@@ -1,0 +1,23 @@
+name: Run Node.js Bot
+
+on:
+  # این خط به شما اجازه می‌دهد تا workflow را به صورت دستی از تب Actions اجرا کنید
+  workflow_dispatch: 
+
+jobs:
+  run-bot:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20' # یا هر نسخه‌ای که نیاز دارید
+
+      - name: Install dependencies
+        run: npm install socket.io-client
+
+      - name: Run the bot script
+        run: node app.js
